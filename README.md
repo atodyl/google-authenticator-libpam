@@ -1,4 +1,4 @@
-# Google Authenticator PAM module
+# Google Authenticator PAM module with verification code caching
 
 Example PAM module demonstrating two-factor authentication.
 
@@ -58,6 +58,13 @@ created a secret key yet. If you would still like them to be able to log
 in, you can pass the "nullok" option on the module's command line:
 
 `  auth required pam_google_authenticator.so nullok`
+
+After the verification code is setup and the user logins for the first time 
+using the verification code this will get cached in `$HOME/.google_authenticator.cache`.
+On next authentications for that user from the same IP address the cache file
+will be checked and the 2FA verification code won't be asked if the cache entry
+has not expired yet in CACHE_TIME seconds. This saves time when you need to
+open multiple SSH connections from the same location.
 
 ## Encrypted home directories
 
