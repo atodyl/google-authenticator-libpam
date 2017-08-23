@@ -56,6 +56,7 @@
 #define SECRET        "~/.google_authenticator"
 #define CODE_PROMPT   "Verification code: "
 #define PWCODE_PROMPT "Password & verification code: "
+#define CACHE_TIME    3600
 
 typedef struct Params {
   const char *secret_filename_spec;
@@ -1550,6 +1551,152 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
   return 0;
 }
 
+static int get_curtimestamp() {
+  struct timespec spec;
+  clock_gettime(CLOCK_REALTIME, &spec);
+  return spec.tv_sec;
+}
+
+static int update_cache(pam_handle_t *pamh,
+                        const char *cache_filename, const char *username) {
+  PAM_CONST void *rhost = NULL;
+  int fd = -1;
+
+  if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS) {
+    log_message(LOG_WARNING, pamh, "Unable to get remote IP from PAM");
+    return 0;
+  }
+  if (strlen(rhost) < 7) {
+    log_message(LOG_WARNING, pamh, "PAM returned bad IP address: %s", rhost);
+    return 0;
+  }
+
+  // If cache file doesn't exist directly create it with the new entry
+  if (access(cache_filename, F_OK) == -1) {
+    log_message(LOG_WARNING , pamh, "Creating %s and caching session %s@%s for %d seconds.",
+                cache_filename, username, rhost, CACHE_TIME);
+    int tstamp = get_curtimestamp();
+    char buf[256];
+    sprintf(buf, "%s;%d\n", rhost, tstamp);
+    fd = open(cache_filename, O_WRONLY|O_CREAT|O_NOFOLLOW|O_TRUNC|O_EXCL, 0600);
+    full_write(fd, buf, strlen(buf));
+    if (fd >= 0) {
+      close(fd);
+    }
+    return 1;
+  }
+
+  // If auth cache file exists update it
+  const size_t fnlength = strlen(cache_filename) + 2;
+  char *tmp_filename = malloc(fnlength);
+  snprintf(tmp_filename, fnlength, "%s~", cache_filename);
+  fd = open(tmp_filename, O_WRONLY|O_CREAT|O_NOFOLLOW|O_TRUNC, 0600);
+  if (fd < 0) {
+    log_message(LOG_WARNING, pamh, "ERROR: Unable to create temp file: %s", tmp_filename);
+    return 0;
+  }
+  FILE * fp = fopen(cache_filename, "r");
+  char * entry = malloc(256);
+  char *ptr;
+  char *ip;
+  char *ts;
+  size_t len = 0;
+  ssize_t read;
+  int found = 0;
+
+  while ((read = getline(&entry, &len, fp)) != -1) {
+    //log_message(LOG_WARNING, pamh, "Got line from cache: %s", entry);
+    if (read < 18) {
+      log_message(LOG_WARNING, pamh, "Bad entry in %s: %s", cache_filename, entry);
+      continue;
+    }
+    if ((ptr = strchr(entry, ';')) == NULL) {
+      log_message(LOG_WARNING, pamh, "Bad entry missing delimiter in %s: %s", cache_filename, entry);
+      continue;
+    }
+    ip = strtok(entry, ";");
+    ts = strtok(NULL, ";");
+
+    if (get_curtimestamp() - atoi(ts) >= CACHE_TIME) {
+      continue;
+    }
+
+    if (strcmp(ip, rhost) == 0 && get_curtimestamp() - atoi(ts) <= CACHE_TIME) {
+      found = 1;
+    }
+    sprintf(entry, "%s;%s\n", ip, ts);
+    write(fd, entry, read);
+    // log_message(LOG_WARNING, pamh, "Cached IP=%s ts=%s", ip, ts);
+  }
+  if (found == 0) {
+    sprintf(entry, "%s;%d\n", rhost, get_curtimestamp());
+    write(fd, entry, strlen(entry));
+  }
+  fclose(fp);
+  close(fd);
+  if (rename(tmp_filename, cache_filename) != 0) {
+    log_message(LOG_WARNING, pamh, "Error trying to rename %s to %s", tmp_filename, cache_filename);
+  }
+}
+
+static int ip_is_cached(pam_handle_t *pamh,
+                        const char *cache_filename, const char *username) {
+  PAM_CONST void *rhost = NULL;
+
+  if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS) {
+    log_message(LOG_WARNING, pamh, "Unable to get remote IP from PAM");
+    return 0;
+  }
+  if (strlen(rhost) < 7) {
+    log_message(LOG_WARNING, pamh, "PAM returned bad IP address: %s", rhost);
+    return 0;
+  }
+  log_message(LOG_WARNING, pamh, "Checking 2FA cache for %s@%s", username, rhost);
+
+  // If cache file doesn't exist return not cached
+  if (access(cache_filename, F_OK) == -1) {
+    return 0;
+  }
+
+  // Check the current IP in the user's 2FA cache and cleanup old/bad entries
+  FILE * fp = fopen(cache_filename, "r");
+  char * entry = malloc(256);
+  char *ptr;
+  char *ip;
+  char *ts;
+  size_t len = 0;
+  ssize_t read;
+  int found = 0;
+  int rc = 0;
+
+  while ((read = getline(&entry, &len, fp)) != -1) {
+    // log_message(LOG_WARNING, pamh, "Got line from cache: %s", entry);
+
+    if (read < 18) {
+      log_message(LOG_WARNING, pamh, "Bad entry in %s: %s", cache_filename, entry);
+      continue;
+    }
+
+    if ((ptr = strchr(entry, ';')) == NULL) {
+      log_message(LOG_WARNING, pamh, "Bad entry missing delimiter in %s: %s", cache_filename, entry);
+      continue;
+    }
+    ip = strtok(entry, ";");
+    ts = strtok(NULL, ";");
+
+    if (get_curtimestamp() - atoi(ts) >= CACHE_TIME) {
+      continue;
+    }
+
+    if (strcmp(ip, rhost) == 0 && get_curtimestamp() - atoi(ts) <= CACHE_TIME) {
+      rc = 1;
+    }
+    // log_message(LOG_WARNING, pamh, "IP=%s ts=%s", ip, ts);
+  }
+  fclose(fp);
+  return rc;
+}
+
 static int google_authenticator(pam_handle_t *pamh, int flags,
                                 int argc, const char **argv) {
   int        rc = PAM_AUTH_ERR;
@@ -1577,6 +1724,15 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
   char* const secret_filename = get_secret_filename(pamh, &params,
                                                     username, &uid);
   int stopped_by_rate_limit = 0;
+
+  char* cache_filename = malloc(strlen(secret_filename) + strlen(".cache") + 1);
+  sprintf(cache_filename, "%s.cache", secret_filename);
+  if (secret_filename && ip_is_cached(pamh, cache_filename, username)) {
+    log_message(LOG_WARNING, pamh, "Source IP found in cachefile %s. Not asking for verification code.", cache_filename);
+    return PAM_SUCCESS;
+  } else {
+    log_message(LOG_WARNING, pamh, "Source IP not found in cachefile %s", cache_filename);
+  }
 
   // Drop privileges.
   {
@@ -1861,6 +2017,9 @@ out:
   if (secret) {
     memset(secret, 0, secretLen);
     free(secret);
+  }
+  if (rc == PAM_SUCCESS) {
+    update_cache(pamh, cache_filename, username);
   }
   return rc;
 }
