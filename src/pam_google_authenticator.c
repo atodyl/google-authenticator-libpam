@@ -56,7 +56,8 @@
 #define SECRET        "~/.google_authenticator"
 #define CODE_PROMPT   "Verification code: "
 #define PWCODE_PROMPT "Password & verification code: "
-#define CACHE_TIME    3600
+#define CACHE_TIME    86400
+#define WHITELIST_2FA "/etc/ssh/2fa_whitelist"
 
 typedef struct Params {
   const char *secret_filename_spec;
@@ -1551,12 +1552,14 @@ static int parse_args(pam_handle_t *pamh, int argc, const char **argv,
   return 0;
 }
 
+// function lucian
 static int get_curtimestamp() {
   struct timespec spec;
   clock_gettime(CLOCK_REALTIME, &spec);
   return spec.tv_sec;
 }
 
+// function lucian
 static int update_cache(pam_handle_t *pamh,
                         const char *cache_filename, const char *username) {
   PAM_CONST void *rhost = NULL;
@@ -1639,6 +1642,40 @@ static int update_cache(pam_handle_t *pamh,
   }
 }
 
+// function lucian
+static int ip_is_whitelisted(pam_handle_t *pamh) {
+  PAM_CONST void *rhost = NULL;
+  size_t len = 0;
+  ssize_t read;
+  char * entry = malloc(256);
+
+  log_message(LOG_INFO, pamh, "Checking whitelist: %s", WHITELIST_2FA);
+  if (pam_get_item(pamh, PAM_RHOST, &rhost) != PAM_SUCCESS) {
+    log_message(LOG_WARNING, pamh, "Unable to get remote IP from PAM");
+    return 0;
+  }
+  if (strlen(rhost) < 7) {
+    log_message(LOG_WARNING, pamh, "PAM returned bad IP address: %s", rhost);
+    return 0;
+  }
+
+  // Check 2FA whitelist
+  if (access(WHITELIST_2FA, F_OK) != -1) {
+    FILE * fp = fopen(WHITELIST_2FA, "r");
+    while ((read = getline(&entry, &len, fp)) != -1) {
+      entry[strcspn(entry, "\r\n")] = 0;
+      log_message(LOG_WARNING, pamh, "read line: %s", entry);
+      if (strcmp(entry, rhost) == 0) {
+        log_message(LOG_WARNING, pamh, "Source IP %s skipped verification code because whitelisted in %s",
+                    rhost, WHITELIST_2FA);
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
+// function lucian
 static int ip_is_cached(pam_handle_t *pamh,
                         const char *cache_filename, const char *username) {
   PAM_CONST void *rhost = NULL;
@@ -1651,23 +1688,23 @@ static int ip_is_cached(pam_handle_t *pamh,
     log_message(LOG_WARNING, pamh, "PAM returned bad IP address: %s", rhost);
     return 0;
   }
-  log_message(LOG_WARNING, pamh, "Checking 2FA cache for %s@%s", username, rhost);
 
   // If cache file doesn't exist return not cached
+  log_message(LOG_WARNING, pamh, "Checking 2FA cache for %s@%s", username, rhost);
   if (access(cache_filename, F_OK) == -1) {
     return 0;
   }
 
   // Check the current IP in the user's 2FA cache and cleanup old/bad entries
   FILE * fp = fopen(cache_filename, "r");
-  char * entry = malloc(256);
   char *ptr;
   char *ip;
   char *ts;
-  size_t len = 0;
-  ssize_t read;
   int found = 0;
   int rc = 0;
+  size_t len = 0;
+  ssize_t read;
+  char * entry = malloc(256);
 
   while ((read = getline(&entry, &len, fp)) != -1) {
     // log_message(LOG_WARNING, pamh, "Got line from cache: %s", entry);
@@ -1725,13 +1762,19 @@ static int google_authenticator(pam_handle_t *pamh, int flags,
                                                     username, &uid);
   int stopped_by_rate_limit = 0;
 
+  // lucian
   char* cache_filename = malloc(strlen(secret_filename) + strlen(".cache") + 1);
   sprintf(cache_filename, "%s.cache", secret_filename);
-  if (secret_filename && ip_is_cached(pamh, cache_filename, username)) {
-    log_message(LOG_WARNING, pamh, "Source IP found in cachefile %s. Not asking for verification code.", cache_filename);
-    return PAM_SUCCESS;
-  } else {
-    log_message(LOG_WARNING, pamh, "Source IP not found in cachefile %s", cache_filename);
+
+  // lucian
+  if (secret_filename) {
+    if (ip_is_cached(pamh, cache_filename, username)) {
+      log_message(LOG_WARNING, pamh, "Source IP found in cachefile %s. Not asking for verification code.", cache_filename);
+      return PAM_SUCCESS;
+    }
+    else if (ip_is_whitelisted(pamh)) {
+      return PAM_SUCCESS;
+    }
   }
 
   // Drop privileges.
