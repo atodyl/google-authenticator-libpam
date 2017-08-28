@@ -59,12 +59,14 @@ in, you can pass the "nullok" option on the module's command line:
 
 `  auth required pam_google_authenticator.so nullok`
 
-After the verification code is setup and the user logins for the first time 
+Added two ways to bypass the verification code (no config options, it's all in the code):
+1. After the verification code is setup and the user logins for the first time 
 using the verification code this will get cached in `$HOME/.google_authenticator.cache`.
 On next authentications for that user from the same IP address the cache file
 will be checked and the 2FA verification code won't be asked if the cache entry
 has not expired yet in CACHE_TIME seconds. This saves time when you need to
 open multiple SSH connections from the same location.
+2. An IP whitelist file in `/etc/ssh/2fa_whitelist` with one IP per line. All IP addresses listed in that file will skip the verification code.
 
 ## Encrypted home directories
 
